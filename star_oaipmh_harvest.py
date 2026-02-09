@@ -19,6 +19,7 @@ Features:
 - Extraction of core Dublin Core metadata (oai_dc)
 - Language-aware description fields (fr / en)
 - One-column-per-contributor flattening
+- Enrichment with the Sudoc ppn with the nnt2ppn web service
 
 Usage:
   python star_oaipmh_harvest.py
@@ -32,6 +33,7 @@ from lxml import etree
 import pandas as pd
 import re
 import sys
+import json
 from typing import Optional
 
 BASE = "https://staroai.theses.fr/OAIHandler"
@@ -88,6 +90,48 @@ def has_open_access(dc_root) -> bool:
     """Return True if any dc:rights equals 'Open Access' (case-insensitive)."""
     rights_vals = texts(dc_root.xpath("dc:rights", namespaces=NS))
     return any(rv.strip().lower() == "open access" for rv in rights_vals)
+    
+def get_sudoc_ppn(oai_id):
+    """Fetches the Sudoc PPN for a given oai_id (NNT)."""
+    url = f"https://www.sudoc.fr/services/nnt2ppn/{oai_id}&format=text/json"
+    try:
+        response = requests.get(url, timeout=5)
+        response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
+        data = response.json()
+
+        if not data or "sudoc" not in data or "results" not in data["sudoc"]:
+            return ""
+
+        results = data["sudoc"]["results"]
+        ppn_m_type = ""
+        first_ppn = ""
+
+        if isinstance(results, dict):
+            result = results.get("result")
+            if result:
+                first_ppn = result.get("ppn", "")
+                if result.get("typerecord") == "m":
+                    ppn_m_type = first_ppn
+        elif isinstance(results, list):
+            for item in results:
+                result = item.get("result")
+                if result:
+                    current_ppn = result.get("ppn", "")
+                    if not first_ppn:
+                        first_ppn = current_ppn
+                    if result.get("typerecord") == "m":
+                        ppn_m_type = current_ppn
+                        break # Prioritize 'm' type and stop if found
+
+        return ppn_m_type if ppn_m_type else first_ppn
+
+    except requests.exceptions.RequestException:
+        # Log the error if necessary, but return empty PPN for now.
+        pass
+    except json.JSONDecodeError:
+        # Handle cases where response is not valid JSON
+        pass
+    return ""
 
 # --------------------------
 # Record extraction
@@ -136,6 +180,7 @@ def extract_record(rec, max_contributors=5):
         "date": "",
         "year": "",
         "rights": "",
+        "ppn": "" # Initialize ppn
     }
 
     for i in range(1, max_contributors + 1):
@@ -150,6 +195,9 @@ def extract_record(rec, max_contributors=5):
     # Filter: dc:rights == "Open Access"
     if not has_open_access(dc_root):
         return row, False
+
+    # Fetch PPN from Sudoc API
+    row["ppn"] = get_sudoc_ppn(oai_id)
 
     # Keep rights values (concat is OK for rights)
     row["rights"] = join_texts(dc_root.xpath("dc:rights", namespaces=NS), sep=" | ")
@@ -200,7 +248,7 @@ def harvest(
     fieldnames = [
         "oai_id", "setSpecs_raw", "set_etab", "set_ddc", "is_diffusable",
         "title", "subject", "description_fr", "description_en",
-        "language", "identifier", "creator", "date", "year", "rights",
+        "language", "identifier", "creator", "date", "year", "rights", "ppn",
     ] + [f"contributor_{i}" for i in range(1, max_contributors + 1)]
 
     kept = 0
