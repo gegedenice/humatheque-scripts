@@ -11,18 +11,30 @@
 # ///
 """
 Thesis PDF -> images -> MinIO uploader (theses.fr)
-
 Reads a CSV containing an 'oai_id' column (thesis identifiers),
 downloads the thesis PDF from theses.fr/{id}/abes, converts first N pages
+to PNG images, and uploads them to a MinIO bucket, under a subfolder.
+
+Dumas PDF -> images -> MinIO uploader (dumas)
+Reads a CSV containing an 'document_url' column (Dumas document url),
+downloads the dissertation PDF, converts first N pages
 to PNG images, and uploads them to a MinIO bucket, under a subfolder.
 
 Dependencies
   PyPDF2 needs Poppler utilities: apt-get install -y poppler-utils
 
 Example:
-  uv run humatheque_theses_to_minio.py \
+  uv run images_to_minio.py \
+    --mode thesis \
     --csv path/_sample_filtered_humatheque_theses_diffusable_openaccess_flat.csv \
     --bucket-subfolder theses/theses.fr \
+    --num-pages 10 \
+    --batch-size 25
+    
+  uv run images_to_minio.py \
+    --mode thesis \
+    --csv path/_sample_filtered_memoires_dumas_openaccess_flat.csv \
+    --bucket-subfolder memoires/dumas \
     --num-pages 10 \
     --batch-size 25
 
@@ -63,6 +75,7 @@ class MinioConfig:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Download theses.fr PDFs, extract pages as images, upload to MinIO.")
+    p.add_argument("--mode", required=True, help="'thesis' or 'dissertation' values")
     p.add_argument("--csv", required=True, help="Input CSV path containing column 'oai_id'")
     p.add_argument("--encoding", default="utf-8", help="CSV encoding (default: utf-8)")
     p.add_argument("--id-column", default="oai_id", help="Column containing thesis IDs (default: oai_id)")
@@ -99,7 +112,12 @@ def ensure_bucket_exists(client: Minio) -> bool:
         print(f"✗ Error with bucket: {e}", file=sys.stderr)
         return False
 
-
+def extract_record_id_from_url(url: str) -> str:
+    path = urlparse(url).path.strip("/")
+    if not path:
+        return "unknown"
+    return path.split("/")[0]
+    
 def download_pdf_to_temp(url: str, timeout: int = 60) -> Optional[str]:
     try:
         resp = requests.get(url, timeout=timeout)
@@ -280,6 +298,69 @@ def process_multiple_theses_from_csv(
 
     return 0 if failed == 0 else 1
 
+def process_dissertation(
+    document_url: str,
+    client: Minio,
+    bucket_subfolder: str,
+    num_pages: int = 5,
+) -> bool:
+    temp_pdf_path = None
+
+    try:
+        dumas_id = extract_record_id_from_url(document_url)
+        print(f"Processing: {dumas_id}")
+
+        temp_pdf_path = download_pdf_to_temp(document_url)
+        if not temp_pdf_path:
+            return False
+
+        images = extract_pages_as_images(temp_pdf_path, num_pages)
+        if not images:
+            return False
+
+        if not upload_images_to_minio(client, bucket_subfolder, dumas_id, images):
+            return False
+
+        print(f"✓ Completed processing dissertation {dumas_id}\n")
+        return True
+
+    finally:
+        if temp_pdf_path and os.path.exists(temp_pdf_path):
+            os.unlink(temp_pdf_path)
+            print("✓ Cleaned up temporary file")
+            
+            
+def process_multiple_dissertations_from_csv(
+    document_urls: list[str],
+    bucket_subfolder: str,
+    num_pages: int = 5,
+):
+    print("Initializing MinIO client...")
+    client = get_minio_client()
+
+    if not ensure_bucket_exists(client):
+        print("Failed to access/create bucket. Exiting.")
+        return
+
+    print(f"\nProcessing {len(document_urls)} dissertation(s)...\n")
+
+    successful = 0
+    failed = 0
+
+    for document_url in document_urls:
+        print("=" * 60)
+        print(f"Processing: {document_url}")
+        print("=" * 60)
+
+        if process_dissertation(document_url, client, bucket_subfolder, num_pages):
+            successful += 1
+        else:
+            failed += 1
+
+    print(f"\n{'='*60}")
+    print(f"Summary: {successful} successful, {failed} failed")
+    print(f"Bucket: {MinioConfig.BUCKET_NAME} on {MinioConfig.ENDPOINT}")
+    print(f"{'='*60}")
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
@@ -287,20 +368,42 @@ def main(argv: list[str]) -> int:
     if not csv_path.exists():
         print(f"[ERROR] CSV not found: {csv_path}", file=sys.stderr)
         return 2
-
-    return process_multiple_theses_from_csv(
-        csv_path=csv_path,
-        id_column=args.id_column,
-        bucket_subfolder=args.bucket_subfolder,
-        num_pages=args.num_pages,
-        dpi=args.dpi,
-        timeout=args.timeout,
-        batch_size=args.batch_size,
-        start=args.start,
-        limit=args.limit,
-        encoding=args.encoding,
-        dry_run=args.dry_run,
-    )
+    if args.mode == "dissertation":
+        document_urls = (
+            df[args.id_column]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .loc[lambda s: s != ""]
+            .tolist()
+        )
+        process_multiple_dissertations_from_csv(
+            document_urls=document_urls,
+            bucket_subfolder=args.bucket_subfolder,
+            num_pages=args.num_pages,
+        )
+    else:
+        thesis_ids = (
+            df[args.id_column]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .loc[lambda s: s != ""]
+            .tolist()
+        )
+        process_multiple_theses_from_csv(
+            csv_path=csv_path,
+            id_column=args.id_column,
+            bucket_subfolder=args.bucket_subfolder,
+            num_pages=args.num_pages,
+            dpi=args.dpi,
+            timeout=args.timeout,
+            batch_size=args.batch_size,
+            start=args.start,
+            limit=args.limit,
+            encoding=args.encoding,
+            dry_run=args.dry_run,
+        )
 
 
 if __name__ == "__main__":
